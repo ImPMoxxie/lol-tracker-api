@@ -1,0 +1,10 @@
+# Evitar subir la base de datos local (opcional)
+lol_trackedb.db
+
+# Evitar subir el entorno virtual
+venv/
+__pycache__/
+*.pyc
+
+# Evitar subir el archivo de llaves sensible
+.env
