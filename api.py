@@ -255,7 +255,28 @@ def calculate_exercises(cutoff_ts: int) -> dict:
     else:
         # Si no hay derrotas y tampoco victorias => plan vacío
         if victories == 0:
-            plan = {}
+            plan = {
+    "piernas": [
+        ("Sentadillas", 20),
+        ("Zancadas (lunges)", 10)
+    ],
+    "pecho_hombros_triceps": [
+        ("Flexiones convencionales", 10),
+        ("Flexiones con palmas juntas", 5)
+    ],
+    "espalda_biceps": [
+        ("Curl isométrico con toalla", 10),
+        ("Superman (lumbar)", 10)
+    ],
+    "core": [
+        ("Plancha frontal (plank)", 30),
+        ("Crunches", 15)
+    ],
+    "cardio": [
+        ("Jumping Jacks", 15),
+        ("Saltos de sentadilla", 10)
+    ]
+}
 
     return {
         "victorias": victories,
