@@ -6,6 +6,8 @@ import requests
 from datetime import datetime, timedelta
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
+from dotenv import load_dotenv
+load_dotenv()   # carga las variables de .env en os.environ
 
 # ---------------------------
 # Configuración
