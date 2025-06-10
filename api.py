@@ -7,9 +7,13 @@ from datetime import datetime, timedelta
 from pydantic import BaseModel
 
 # Cargar variables de entorno desde .env
-load_dotenv()
+# Carga de variables de entorno
+# Carga de variables de entorno
+env_path = os.path.join(os.path.dirname(__file__), ".env")
+load_dotenv(env_path, override=True)
 
 # Configuración
+
 API_KEY = os.getenv("RIOT_API_KEY")
 if not API_KEY:
     raise RuntimeError("❌ RIOT_API_KEY no definida en el entorno")
