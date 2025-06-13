@@ -6,49 +6,37 @@ import requests
 from datetime import datetime, timedelta
 from pydantic import BaseModel
 
-# Carga de variables de entorno desde .env
-# Override asegura que cualquier variable previa se reemplace
+# --- Carga de variables de entorno desde .env ---
 env_path = os.path.join(os.path.dirname(__file__), ".env")
 load_dotenv(env_path, override=True)
 
-# Configuración
-# Clave de API de Riot Games
-API_KEY = os.getenv("RIOT_API_KEY")
+# --- Configuración global ---
+API_KEY = os.getenv("RIOT_API_KEY")  # Clave de API de Riot Games
 if not API_KEY:
     raise RuntimeError("❌ RIOT_API_KEY no definida en el entorno")
-# Región para llamadas a Account–V1 y Match–V5
-REGIONAL = "americas"
-# Archivo local SQLite para persistencia
-DB_FILE = "lol_trackedb.db"
-# Límite diario de derrotas que disparará fin de conteo
-daily_def_limit = 5
-# Puntos otorgados por cada victoria (usados para deducir ejercicios)
-points_per_victory = 5
-# Solo estos modos de juego se contabilizarán (Normal Draft y Ranked)
-ALLOWED_QUEUES = {400, 420}
+REGIONAL = "americas"               # Región para Account–V1 y Match–V5
+DB_FILE = "lol_trackedb.db"         # Archivo SQLite para persistencia
+daily_def_limit = 5                   # Límite de derrotas registradas por día
+points_per_victory = 5                # Puntos base que aporta cada victoria
+ALLOWED_QUEUES = {400, 420}           # Solo Normal Draft (400) y Ranked Solo/Duo (420)
 
-# Inicializar FastAPI
+# --- Inicialización de la API ---
 app = FastAPI(
     title="LoL Tracker API",
-    version="1.2.0",
-    description="Procesa partidas (solo queueId 400 y 420) y genera plan de ejercicios"
+    version="1.3.0",
+    description="Procesa partidas con rachas dinámicas y plan de ejercicios interactivo"
 )
 
-# Modelo de entrada para validar el Riot ID
+# --- Modelo de entrada ---
 class RiotID(BaseModel):
-    game_name: str  # Nombre de invocador
-    tag_line: str   # Etiqueta de región/prefijo
+    game_name: str  # Nombre del invocador (sin #TAG)
+    tag_line: str   # Sufijo de región, ej. LAS, BR1
 
-# Helpers de SQLite
+# --- Helpers para la base de datos SQLite ---
 def get_db():
-    """
-    Abre conexión a SQLite y crea tablas si no existen:
-     - matches: info básica de cada partida (incluye queue_id para filtrado)
-     - match_events: eventos (victoria/derrota) asociados a cada partida
-    """
     conn = sqlite3.connect(DB_FILE, check_same_thread=False)
     c = conn.cursor()
-    # Creamos tablas con script para asegurar integridad
+    # Creamos tablas si no existen
     c.executescript("""
 CREATE TABLE IF NOT EXISTS matches (
   match_id TEXT PRIMARY KEY,
@@ -68,12 +56,8 @@ CREATE TABLE IF NOT EXISTS match_events (
     conn.commit()
     return conn, c
 
-# Funciones de la Riot API
+# --- Riot API calls ---
 def get_puuid(game_name: str, tag_line: str) -> str:
-    """
-    Llama al endpoint Account–V1 para convertir Riot ID en PUUID.
-    Lanza HTTPException 401 si la API key no está autorizada.
-    """
     url = (
         f"https://{REGIONAL}.api.riotgames.com"
         f"/riot/account/v1/accounts/by-riot-id/{game_name}/{tag_line}?api_key={API_KEY}"
@@ -84,15 +68,11 @@ def get_puuid(game_name: str, tag_line: str) -> str:
     resp.raise_for_status()
     puuid = resp.json().get("puuid")
     if not puuid:
-        raise HTTPException(status_code=500, detail="Respuesta de Account–V1 sin campo puuid")
+        raise HTTPException(status_code=500, detail="Falta puuid en respuesta de Account–V1")
     return puuid
 
 
 def fetch_recent_matches(puuid: str, count: int = 5) -> list:
-    """
-    Obtiene los IDs de las últimas `count` partidas de un jugador.
-    No filtra por queue; eso se hace en process_match.
-    """
     url = (
         f"https://{REGIONAL}.api.riotgames.com"
         f"/lol/match/v5/matches/by-puuid/{puuid}/ids?start=0&count={count}"
@@ -105,37 +85,24 @@ def fetch_recent_matches(puuid: str, count: int = 5) -> list:
 
 
 def process_match(match_id: str, puuid: str) -> dict:
-    """
-    Procesa detalles de una partida:
-     - Aplica filtro de queue_id
-     - Extrae victoria/derrota del participante
-     - Formatea timestamps a legible
-    Devuelve None si el modo no está permitido.
-    """
     url = f"https://{REGIONAL}.api.riotgames.com/lol/match/v5/matches/{match_id}"
     resp = requests.get(url, headers={"X-Riot-Token": API_KEY})
     resp.raise_for_status()
     info = resp.json().get("info", {})
-
-    # Filtro por queue_id para limitar a modos deseados
     queue_id = info.get("queueId", 0)
+    # Filtrar solo modos permitidos
     if queue_id not in ALLOWED_QUEUES:
         return None
-
-    # Localizar información del jugador dentro de la partida
     participant = next((p for p in info.get("participants", []) if p.get("puuid") == puuid), None)
     if not participant:
         return None
-
-    # Determinar resultado: victoria o derrota
+    # Determinar evento: victoria o derrota
     events = ["victoria" if participant.get("win", False) else "derrota"]
-
-    # Formateo de tiempos en ms a cadena legible
+    # Formatear timestamps
     start_ts = info.get("gameStartTimestamp", 0)
     end_ts = info.get("gameEndTimestamp", 0)
-    start_time = datetime.fromtimestamp(start_ts / 1000).strftime("%Y-%m-%d %H:%M:%S")
-    end_time = datetime.fromtimestamp(end_ts / 1000).strftime("%Y-%m-%d %H:%M:%S")
-
+    start_time = datetime.fromtimestamp(start_ts/1000).strftime("%Y-%m-%d %H:%M:%S")
+    end_time = datetime.fromtimestamp(end_ts/1000).strftime("%Y-%m-%d %H:%M:%S")
     return {
         "match_id": match_id,
         "queue_id": queue_id,
@@ -146,20 +113,13 @@ def process_match(match_id: str, puuid: str) -> dict:
         "events": events
     }
 
-# DB helpers
+# --- DB helpers ---
 def get_done_ids(c) -> set:
-    """
-    Devuelve set de match_id ya almacenados en modos permitidos.
-    """
     c.execute("SELECT match_id FROM matches WHERE queue_id IN (?,?)", tuple(ALLOWED_QUEUES))
     return {row[0] for row in c.fetchall()}
 
 
 def save_match(conn, c, rec: dict):
-    """
-    Guarda registro de partida y sus eventos en la base de datos.
-    Usa IGNORE para evitar duplicados.
-    """
     if not rec:
         return
     c.execute(
@@ -170,7 +130,7 @@ def save_match(conn, c, rec: dict):
         c.execute("INSERT INTO match_events(match_id, event) VALUES(?,?)", (rec["match_id"], evt))
     conn.commit()
 
-# Ejercicios base y calculo de plan
+# --- Lista de ejercicios y cálculo de plan ---
 FULL_WORKOUT = [
     ("Sentadillas", 40),
     ("Zancadas (lunges)", 20),
@@ -184,59 +144,82 @@ FULL_WORKOUT = [
     ("Saltos de sentadilla", 20)
 ]
 
-def calculate_plan(defeats: int, victories: int) -> dict:
+# --- Función para calcular puntos dinámicos según rachas ---
+def calculate_dynamic_points(c, cutoff):
     """
-    Construye el plan de ejercicios:
-     - Multiplica reps base por número de derrotas
-     - Resta puntos de victoria de las repeticiones totales
+    Recorre todos los eventos de hoy en orden cronológico y aplica:
+      - streak reinicializable: +1 por victoria, reset a 0 en derrota.
+      - al cada derrota: gained = streak * points_per_victory, acumula en points
+        y aumenta points_per_victory += gained.
+      - detiene al llegar al límite de derrotas diarias.
+    Devuelve puntos totales acumulados.
     """
-    points = victories * points_per_victory
-    base = [(name, reps * defeats) for name, reps in FULL_WORKOUT]
-    final = []
-    for name, reps in base:
-        # Si los puntos cubren todos los reps, eliminamos ese ejercicio
-        if points >= reps:
-            points -= reps
-            continue
-        # Si quedan puntos parciales, ajustamos reps
-        if points > 0:
-            final.append({"nombre": name, "reps": reps - points})
-            points = 0
-        else:
-            final.append({"nombre": name, "reps": reps})
-    return {"puntos_restantes": points, "ejercicios": final}
+    # Obtener eventos ordenados por fin de partida\    
+    c.execute(
+        "SELECT m.end_timestamp, me.event FROM match_events me"
+        " JOIN matches m ON me.match_id=m.match_id"
+        " WHERE m.end_timestamp>=?"
+        " ORDER BY m.end_timestamp",
+        (cutoff,)
+    )
+    rows = c.fetchall()
+    points = 0
+    streak = 0
+    defeats = 0
+    p_per_victory = points_per_victory
+    for ts, event in rows:
+        if event == "victoria":
+            streak += 1
+        elif event == "derrota":
+            # calcular puntos al romper la racha
+            gained = streak * p_per_victory
+            points += gained
+            # escalar valor de victoria para siguientes rachas
+            p_per_victory += gained
+            streak = 0
+            defeats += 1
+            if defeats >= daily_def_limit:
+                break
+    return points
 
-# Crear respuesta JSON
-def create_response(defeats: int, victories: int, processed: list) -> dict:
+# --- Construcción de la respuesta JSON ---
+def create_response(defeats: int, victories: int, points: int, processed: list) -> dict:
     """
-    Genera respuesta final con conteos y plan de ejercicios.
+    Arma la respuesta final:
+      - derrotas_hoy, victorias_hoy, puntos_restantes
+      - plan_ejercicio: lista resultante tras descuento de puntos
+      - nuevas_partidas: detalles de partidas procesadas
     """
-    plan = calculate_plan(defeats, victories)
+    # base de ejercicio ajustada según derrotas
+    base = [(name, reps * defeats) for name, reps in FULL_WORKOUT]
+    final_ex = []
+    rem_points = points
+    for name, reps in base:
+        if rem_points >= reps:
+            rem_points -= reps
+            continue
+        if rem_points > 0:
+            final_ex.append({"nombre": name, "reps": reps - rem_points})
+            rem_points = 0
+        else:
+            final_ex.append({"nombre": name, "reps": reps})
+
     return {
         "derrotas_hoy": defeats,
         "victorias_hoy": victories,
-        "puntos_restantes": plan["puntos_restantes"],
-        "plan_ejercicio": plan["ejercicios"],
+        "puntos_restantes": rem_points,
+        "plan_ejercicio": final_ex,
         "nuevas_partidas": processed
     }
 
-# Endpoint principal
+# --- Endpoint principal: POST /procesar-partidas/ ---
 @app.post("/procesar-partidas/")
 def procesar_partidas(id: RiotID):
-    """
-    Flujo principal:
-     1. Obtiene puuid
-     2. Cuenta derrotas/victorias actuales del día
-     3. Trae IDs recientes y filtra ya procesadas
-     4. Procesa nuevas partidas según queue_id
-     5. Actualiza base y calcula plan de ejercicios
-    """
     conn, c = get_db()
     puuid = get_puuid(id.game_name, id.tag_line)
-    # Corte desde medianoche para conteos diarios
     cutoff = int(datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000)
 
-    # Conteo de derrotas y victorias hoy
+    # Primer conteo simple de derrotas y victorias hoy para límites
     c.execute(
         "SELECT COUNT(*) FROM match_events me JOIN matches m ON me.match_id=m.match_id "
         "WHERE me.event='derrota' AND m.end_timestamp>=?", (cutoff,)
@@ -248,11 +231,13 @@ def procesar_partidas(id: RiotID):
     )
     victories = c.fetchone()[0]
 
-    # Si límite de derrotas alcanzado, no procesar más
+    # Si excedió límite de derrotas, devuelve respuesta sin procesar más partidas
     if defeats >= daily_def_limit:
-        return create_response(defeats, victories, [])
+        # calcular puntos dinámicos y plan final
+        dyn_points = calculate_dynamic_points(c, cutoff)
+        return create_response(defeats, victories, dyn_points, [])
 
-    # Obtener y procesar partidas nuevas
+    # Procesar nuevas partidas
     recent_ids = fetch_recent_matches(puuid)
     done_ids = get_done_ids(c)
     processed = []
@@ -260,12 +245,11 @@ def procesar_partidas(id: RiotID):
         if mid in done_ids:
             continue
         rec = process_match(mid, puuid)
-        # Saltar si modo no permitido o partida antigua
         if not rec or rec["end_timestamp"] < cutoff:
             continue
         save_match(conn, c, rec)
         processed.append(rec)
-        # Actualizar conteo dinámico de derrotas/victorias
+        # actualizar conteo básico de derrotas/victorias
         if "derrota" in rec["events"]:
             defeats += 1
             if defeats >= daily_def_limit:
@@ -273,4 +257,6 @@ def procesar_partidas(id: RiotID):
         else:
             victories += 1
 
-    return create_response(defeats, victories, processed)
+    # Calcular puntos dinámicos tras procesar todas las partidas
+    dyn_points = calculate_dynamic_points(c, cutoff)
+    return create_response(defeats, victories, dyn_points, processed)
