@@ -178,6 +178,8 @@ def calculate_dynamic_points(c, cutoff):
         (cutoff,)
     )
     rows = c.fetchall()
+    # DEBUG: mostrar eventos leídos para verificar filtro
+    print("DEBUG: rows for point calc ->", rows)
     points = 0
     streak = 0
     defeats = 0
@@ -270,7 +272,8 @@ def procesar_partidas(id: RiotID):
             victories += 1
 
     # 3) Calcular puntos dinámicos tras guardar todas las partidas nuevas
-    dyn_points = calculate_dynamic_points(c, cutoff)
+    dyn_points = calculate_dynamic_points(c, cutoff) 
+    
 
     # 4) Devolver respuesta con puntos y nuevas partidas
     return create_response(defeats, victories, dyn_points, processed)
