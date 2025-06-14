@@ -278,4 +278,4 @@ def procesar_partidas(id: RiotID):
 
     # 5. Al final, recalculamos puntos (o reutilizamos current_points) y devolvemos:
     dyn_points = calculate_dynamic_points(c, cutoff)
-    return create_response(defeats, victories, current_points, processed)
+    return create_response(defeats, victories, dyn_points, processed)
