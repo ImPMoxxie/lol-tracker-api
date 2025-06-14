@@ -250,14 +250,7 @@ def procesar_partidas(id: RiotID):
     )
     victories = c.fetchone()[0]
 
-    # 2) Calcular puntos dinámicos siempre para mostrar valor real
-    dyn_points = calculate_dynamic_points(c, cutoff)
-
-    # 3) Si alcanzó límite de derrotas, devolver únicamente los puntos actuales
-    if defeats >= daily_def_limit:
-        return create_response(defeats, victories, dyn_points, [])
-
-    # 4) Procesar partidas nuevas
+    # 2) Procesar partidas nuevas
     recent_ids = fetch_recent_matches(puuid)
     done_ids = get_done_ids(c)
     processed = []
@@ -276,6 +269,8 @@ def procesar_partidas(id: RiotID):
         else:
             victories += 1
 
-    # 5) Devolver respuesta con puntos actualizados y nuevas partidas
-    return create_response(defeats, victories, dyn_points, processed)
+    # 3) Calcular puntos dinámicos tras guardar todas las partidas nuevas
+    dyn_points = calculate_dynamic_points(c, cutoff)
 
+    # 4) Devolver respuesta con puntos y nuevas partidas
+    return create_response(defeats, victories, dyn_points, processed)
