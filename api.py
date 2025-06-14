@@ -95,6 +95,9 @@ def process_match(match_id: str, puuid: str) -> dict:
     if info.get("gameEndedInEarlySurrender", False):
         return None
 
+    if info.get("gameDuration", 0) < 300:  # Partidas de menos de 5 minutos
+        return None
+
     # 2) Filtrar por modos permitidos
     queue_id = info.get("queueId", 0)
     if queue_id not in ALLOWED_QUEUES:
