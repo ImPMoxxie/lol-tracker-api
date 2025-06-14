@@ -85,24 +85,36 @@ def fetch_recent_matches(puuid: str, count: int = 5) -> list:
 
 
 def process_match(match_id: str, puuid: str) -> dict:
+    # Llamada a Match-V5
     url = f"https://{REGIONAL}.api.riotgames.com/lol/match/v5/matches/{match_id}"
     resp = requests.get(url, headers={"X-Riot-Token": API_KEY})
     resp.raise_for_status()
     info = resp.json().get("info", {})
+
+    # 1) Omitir remakes / early surrenders
+    if info.get("gameEndedInEarlySurrender", False):
+        return None
+
+    # 2) Filtrar por modos permitidos
     queue_id = info.get("queueId", 0)
-    # Filtrar solo modos permitidos
     if queue_id not in ALLOWED_QUEUES:
         return None
-    participant = next((p for p in info.get("participants", []) if p.get("puuid") == puuid), None)
+
+    # 3) Buscar la participación del invocador y determinar evento
+    participant = next((p for p in info.get("participants", [])
+                        if p.get("puuid") == puuid), None)
     if not participant:
         return None
     # Determinar evento: victoria o derrota
     events = ["victoria" if participant.get("win", False) else "derrota"]
-    # Formatear timestamps
+
+    
+    # 4) Formatear timestamps de la partida
     start_ts = info.get("gameStartTimestamp", 0)
-    end_ts = info.get("gameEndTimestamp", 0)
+    end_ts   = info.get("gameEndTimestamp", 0)
     start_time = datetime.fromtimestamp(start_ts/1000).strftime("%Y-%m-%d %H:%M:%S")
-    end_time = datetime.fromtimestamp(end_ts/1000).strftime("%Y-%m-%d %H:%M:%S")
+    end_time   = datetime.fromtimestamp(end_ts/1000).strftime("%Y-%m-%d %H:%M:%S")
+
     return {
         "match_id": match_id,
         "queue_id": queue_id,
