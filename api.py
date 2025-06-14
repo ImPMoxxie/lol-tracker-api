@@ -232,11 +232,13 @@ def create_response(defeats: int, victories: int, points: int, processed: list) 
 def procesar_partidas(id: RiotID):
     conn, c = get_db()
     puuid = get_puuid(id.game_name, id.tag_line)
-    cutoff = int(datetime.now()
-                 .replace(hour=0, minute=0, second=0, microsecond=0)
-                 .timestamp() * 1000)
+    cutoff = int(
+        datetime.now()
+        .replace(hour=0, minute=0, second=0, microsecond=0)
+        .timestamp() * 1000
+    )
 
-    # 1. Contar derrotas y victorias actuales
+    # 1) Contar derrotas y victorias de hoy
     c.execute(
         "SELECT COUNT(*) FROM match_events me JOIN matches m ON me.match_id=m.match_id "
         "WHERE me.event='derrota' AND m.end_timestamp>=?", (cutoff,)
@@ -248,15 +250,14 @@ def procesar_partidas(id: RiotID):
     )
     victories = c.fetchone()[0]
 
+    # 2) Calcular puntos dinámicos siempre para mostrar valor real
+    dyn_points = calculate_dynamic_points(c, cutoff)
 
-    # 2. Calcular puntos dinámicos **siempre**, antes de cortar por límite de derrotas**
-    current_points = calculate_dynamic_points(c, cutoff)
-
-    # 3. Si ya alcanzó el límite de derrotas, devolvemos sin procesar más partidas
+    # 3) Si alcanzó límite de derrotas, devolver únicamente los puntos actuales
     if defeats >= daily_def_limit:
-        return create_response(defeats, victories, current_points, [])
+        return create_response(defeats, victories, dyn_points, [])
 
-    # 4. Procesar nuevas partidas (igual que antes)… 
+    # 4) Procesar partidas nuevas
     recent_ids = fetch_recent_matches(puuid)
     done_ids = get_done_ids(c)
     processed = []
@@ -268,7 +269,6 @@ def procesar_partidas(id: RiotID):
             continue
         save_match(conn, c, rec)
         processed.append(rec)
-        # actualizar conteo básico de derrotas/victorias
         if "derrota" in rec["events"]:
             defeats += 1
             if defeats >= daily_def_limit:
@@ -276,6 +276,6 @@ def procesar_partidas(id: RiotID):
         else:
             victories += 1
 
-    # 5. Al final, recalculamos puntos (o reutilizamos current_points) y devolvemos:
-    dyn_points = calculate_dynamic_points(c, cutoff)
+    # 5) Devolver respuesta con puntos actualizados y nuevas partidas
     return create_response(defeats, victories, dyn_points, processed)
+
