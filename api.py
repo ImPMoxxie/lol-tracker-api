@@ -84,9 +84,10 @@ def get_puuid(game_name: str, tag_line: str) -> str:
     return puuid
 
 # --- Paginación para IDs de partidas ---
-def fetch_all_match_ids(puuid: str, page_size: int = 20) -> list:
+def fetch_all_match_ids(puuid: str, page_size: int = 100) -> list:
     """
     Obtiene todas las match IDs de Riot, paginando hasta que batch < page_size.
+    Aumenta page_size a 100 para reducir número de peticiones.
     """
     ids = []
     start = 0
