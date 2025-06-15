@@ -26,8 +26,8 @@ ALLOWED_QUEUES = {400, 420}       # Modos permitidos (Normal Draft, Ranked Solo/
 # --- Inicialización de FastAPI ---
 app = FastAPI(
     title="LoL Tracker API",
-    version="1.5.1",
-    description="Procesa partidas con paginación, streaks y bankeo manual"
+    version="1.5.2",
+    description="Procesa partidas con paginación, maneja rate limits y bankeo manual"
 )
 
 # --- Modelo de entrada ---
@@ -64,6 +64,7 @@ CREATE TABLE IF NOT EXISTS streak_bank (
 def riot_request(path: str) -> dict:
     """
     Realiza una petición GET a Riot con el header X-Riot-Token.
+    Incluye pausa para respetar rate limits.
     """
     url = f"https://{REGIONAL}.api.riotgames.com{path}"
     headers = {"X-Riot-Token": API_KEY}
@@ -71,9 +72,15 @@ def riot_request(path: str) -> dict:
     if resp.status_code in (401, 403):
         raise HTTPException(401, "API Key no autorizada o caducada")
     if resp.status_code == 429:
-        raise HTTPException(429, "Rate limit alcanzado")
+        # Esperar y reintentar
+        retry_after = int(resp.headers.get("Retry-After", 1))
+        time.sleep(retry_after)
+        resp = requests.get(url, headers=headers)
     resp.raise_for_status()
-    return resp.json()
+    data = resp.json()
+    # Pausa breve para no golpear el rate limit
+    time.sleep(0.5)
+    return data
 
 # --- Obtención de PUUID ---
 def get_puuid(game_name: str, tag_line: str) -> str:
@@ -86,8 +93,8 @@ def get_puuid(game_name: str, tag_line: str) -> str:
 # --- Paginación para IDs de partidas ---
 def fetch_all_match_ids(puuid: str, page_size: int = 100) -> list:
     """
-    Obtiene todas las match IDs de Riot, paginando hasta que batch < page_size.
-    Aumenta page_size a 100 para reducir número de peticiones.
+    Obtiene todas las match IDs de Riot, paginando hasta batch < page_size.
+    Pausa breve entre páginas para evitar 429.
     """
     ids = []
     start = 0
@@ -98,6 +105,8 @@ def fetch_all_match_ids(puuid: str, page_size: int = 100) -> list:
         if not batch:
             break
         ids.extend(batch)
+        # Pausa para respetar rate limits
+        time.sleep(0.5)
         if len(batch) < page_size:
             break
         start += page_size
@@ -214,6 +223,8 @@ def procesar_partidas(id: RiotID):
             )
         conn.commit()
         processed.append(rec)
+        # Pausa entre procesamientos
+        time.sleep(0.5)
         if 'derrota' in rec['events']:
             defeats += 1
             if defeats >= DAILY_DEF_LIMIT:
