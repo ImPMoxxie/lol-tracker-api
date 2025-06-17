@@ -97,6 +97,21 @@ def fetch_recent_matches(puuid: str, count: int = 5) -> list:
         f"/lol/match/v5/matches/by-puuid/{puuid}/ids?start=0&count={count}"
     )
 
+def fetch_all_match_ids(puuid: str, page_size: int = 100) -> list:
+    all_ids = []
+    start = 0
+    while True:
+        batch = riot_request(
+            f"/lol/match/v5/matches/by-puuid/{puuid}/ids?start={start}&count={page_size}"
+        )
+        if not batch:
+            break
+        all_ids.extend(batch)
+        if len(batch) < page_size:
+            break
+        start += page_size
+    return all_ids
+
 # Procesa partida usando cache
 def process_match(match_id: str, puuid: str, conn, c) -> dict:
     c.execute("SELECT info_json FROM match_cache WHERE match_id=?", (match_id,))
@@ -190,7 +205,7 @@ def procesar_partidas(id: RiotID):
     c.execute("SELECT COUNT(*) FROM match_events me JOIN matches m ON me.match_id=m.match_id WHERE me.event='victoria' AND m.end_timestamp>=?", (cutoff,))
     victories = c.fetchone()[0]
     processed = []
-    for mid in fetch_recent_matches(puuid):
+    for mid in fetch_all_match_ids(puuid):
         c.execute("SELECT 1 FROM matches WHERE match_id=?", (mid,))
         if c.fetchone():
             continue
