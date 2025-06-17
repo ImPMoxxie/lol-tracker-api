@@ -3,4 +3,4 @@ uvicorn
 requests
 python-dotenv
 schedule
-riotwatcher==4.1.3
+riotwatcher==3.3.1
