@@ -1,4 +1,5 @@
 ﻿import os
+import threading  # Para hilos de scheduler
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
 import sqlite3
@@ -7,6 +8,8 @@ import time
 from datetime import datetime
 from pydantic import BaseModel
 from riotwatcher import LolWatcher
+import schedule  # Para tareas programadas
+import requests
 
 # --- Carga de variables de entorno ---
 env_path = os.path.join(os.path.dirname(__file__), ".env")
@@ -20,12 +23,12 @@ REGIONAL = "americas"           # Región para Account y Match API
 DB_FILE = "lol_trackedb.db"     # Archivo SQLite
 DAILY_DEF_LIMIT = 5               # Límite derrotas diarias
 POINTS_PER_VICTORY_BASE = 5       # Puntos base por victoria
-ALLOWED_QUEUES = {400, 420}       # Modos permitidos
+ALLOWED_QUEUES = {400, 420}       # Modos de juego permitidos
 
 # --- Inicialización de FastAPI y RiotWatcher ---
 app = FastAPI(
     title="LoL Tracker API",
-    version="1.6.0",
+    version="1.6.1",
     description="Procesa partidas con cache local y RiotWatcher"
 )
 watcher = LolWatcher(API_KEY)
@@ -35,11 +38,10 @@ class RiotID(BaseModel):
     game_name: str
     tag_line: str
 
-# --- Conexión a la base de datos ---
+# === Funciones de base de datos ===
 def get_db():
     conn = sqlite3.connect(DB_FILE, check_same_thread=False)
     c = conn.cursor()
-    # Tablas principales, cache y streaks
     c.executescript("""
 CREATE TABLE IF NOT EXISTS matches (
   match_id TEXT PRIMARY KEY,
@@ -65,7 +67,7 @@ CREATE TABLE IF NOT EXISTS match_cache (
     conn.commit()
     return conn, c
 
-# --- Helpers para Riot API ---
+# === Helpers para Riot API ===
 def riot_request(path: str) -> dict:
     url = f"https://{REGIONAL}.api.riotgames.com{path}"
     headers = {"X-Riot-Token": API_KEY}
@@ -81,7 +83,7 @@ def riot_request(path: str) -> dict:
     time.sleep(0.5)
     return data
 
-# --- Obtener PUUID ---
+# Obtiene puuid
 def get_puuid(game_name: str, tag_line: str) -> str:
     data = riot_request(f"/riot/account/v1/accounts/by-riot-id/{game_name}/{tag_line}")
     puuid = data.get("puuid")
@@ -89,21 +91,19 @@ def get_puuid(game_name: str, tag_line: str) -> str:
         raise HTTPException(500, "No se obtuvo puuid")
     return puuid
 
-# --- Obtener últimos match IDs (5) ---
+# Obtiene IDs recientes (count=5)
 def fetch_recent_matches(puuid: str, count: int = 5) -> list:
     return riot_request(
         f"/lol/match/v5/matches/by-puuid/{puuid}/ids?start=0&count={count}"
     )
 
-# --- Procesar datos de partida con cache ---
+# Procesa partida usando cache
 def process_match(match_id: str, puuid: str, conn, c) -> dict:
-    # Revisar cache local
     c.execute("SELECT info_json FROM match_cache WHERE match_id=?", (match_id,))
     row = c.fetchone()
     if row:
         info = json.loads(row[0])
     else:
-        # Obtener info con RiotWatcher
         data = watcher.match.by_id(REGIONAL, match_id)
         info = data.get("info", {})
         c.execute(
@@ -111,7 +111,7 @@ def process_match(match_id: str, puuid: str, conn, c) -> dict:
             (match_id, json.dumps(info))
         )
         conn.commit()
-    # Filtrar remakes y partidas cortas
+    # Filtrar remake o partidas <5min
     if info.get("gameEndedInEarlySurrender") or info.get("gameDuration", 0) < 300:
         return None
     queue_id = info.get("queueId", 0)
@@ -128,10 +128,8 @@ def process_match(match_id: str, puuid: str, conn, c) -> dict:
         "events": ["victoria" if me.get("win") else "derrota"]
     }
 
-# --- Gestión de streaks local (NO TOCAR) ---
-
+# === BLOQUE DE GESTIÓN DE STREAKS (NO TOCAR) ===
 def update_streak(conn, c, event_timestamp, is_victory):
-    """Actualiza streak diario, resetea en derrota."""
     date_str = datetime.fromtimestamp(event_timestamp/1000).strftime('%Y-%m-%d')
     c.execute("SELECT pending_streak, has_banked FROM streak_bank WHERE date=?", (date_str,))
     row = c.fetchone()
@@ -143,31 +141,22 @@ def update_streak(conn, c, event_timestamp, is_victory):
         pending, banked = row
     if banked:
         return
-    if is_victory:
-        pending += 1
-    else:
-        pending = 0
+    pending = pending + 1 if is_victory else 0
     c.execute("UPDATE streak_bank SET pending_streak=? WHERE date=?", (pending, date_str))
     conn.commit()
 
-
 def mark_streak_banked(conn, c, date_str):
-    """Marca la racha de la fecha como cobrada."""
     c.execute("UPDATE streak_bank SET has_banked=1 WHERE date=?", (date_str,))
     conn.commit()
 
-
 def calculate_dynamic_points(conn, c, cutoff):
-    """Calcula puntos dinámicos con rachas y derrotas diarias."""
     rows = c.execute(
         "SELECT m.end_timestamp, me.event FROM match_events me "
         "JOIN matches m ON me.match_id=m.match_id "
         "WHERE m.end_timestamp>=? "
         "ORDER BY m.end_timestamp", (cutoff,)
     ).fetchall()
-    points = 0
-    streak = 0
-    defeats = 0
+    points, streak, defeats = 0, 0, 0
     p_per_victory = POINTS_PER_VICTORY_BASE
     for ts, event in rows:
         if event == "victoria":
@@ -181,48 +170,37 @@ def calculate_dynamic_points(conn, c, cutoff):
             if defeats >= DAILY_DEF_LIMIT:
                 break
     return points
+# === FIN BLOQUE STREAKS ===
+
+# Marca streak bancado al fin del día
+def daily_bank_job():
+    conn, c = get_db()
+    date_str = datetime.now().strftime('%Y-%m-%d')
+    mark_streak_banked(conn, c, date_str)
 
 # --- Endpoint principal ---
 @app.post("/procesar-partidas/")
 def procesar_partidas(id: RiotID):
     conn, c = get_db()
     puuid = get_puuid(id.game_name, id.tag_line)
-    cutoff = int(
-        datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000
-    )
-    # Conteo inicial defeats/victories
-    c.execute(
-        "SELECT COUNT(*) FROM match_events me JOIN matches m ON me.match_id=m.match_id "
-        "WHERE me.event='derrota' AND m.end_timestamp>=?", (cutoff,)
-    )
+    cutoff = int(datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000)
+    # Conteo inicial
+    c.execute("SELECT COUNT(*) FROM match_events me JOIN matches m ON me.match_id=m.match_id WHERE me.event='derrota' AND m.end_timestamp>=?", (cutoff,))
     defeats = c.fetchone()[0]
-    c.execute(
-        "SELECT COUNT(*) FROM match_events me JOIN matches m ON me.match_id=m.match_id "
-        "WHERE me.event='victoria' AND m.end_timestamp>=?", (cutoff,)
-    )
+    c.execute("SELECT COUNT(*) FROM match_events me JOIN matches m ON me.match_id=m.match_id WHERE me.event='victoria' AND m.end_timestamp>=?", (cutoff,))
     victories = c.fetchone()[0]
     processed = []
-    # Obtener IDs recientes (solo 5)
-    recent_ids = fetch_recent_matches(puuid)
-    for mid in recent_ids:
+    for mid in fetch_recent_matches(puuid):
         c.execute("SELECT 1 FROM matches WHERE match_id=?", (mid,))
         if c.fetchone():
             continue
         rec = process_match(mid, puuid, conn, c)
         if not rec or rec["end_timestamp"] < cutoff:
             continue
-        # Guardar partida y eventos
-        c.execute(
-            "INSERT OR IGNORE INTO matches(match_id,queue_id,start_timestamp,end_timestamp) VALUES(?,?,?,?)",
-            (rec['match_id'], rec['queue_id'], rec['start_timestamp'], rec['end_timestamp'])
-        )
+        c.execute("INSERT OR IGNORE INTO matches(match_id,queue_id,start_timestamp,end_timestamp) VALUES(?,?,?,?)", (rec['match_id'], rec['queue_id'], rec['start_timestamp'], rec['end_timestamp']))
         for evt in rec['events']:
-            c.execute(
-                "INSERT INTO match_events(match_id,event) VALUES(?,?)", 
-                (rec['match_id'], evt)
-            )
-            # Actualiza streak local
-            update_streak(conn, c, rec['end_timestamp'], evt == 'victoria')
+            c.execute("INSERT INTO match_events(match_id,event) VALUES(?,?)", (rec['match_id'], evt))
+            update_streak(conn, c, rec['end_timestamp'], evt=='victoria')
         conn.commit()
         processed.append(rec)
         if 'derrota' in rec['events']:
@@ -231,14 +209,8 @@ def procesar_partidas(id: RiotID):
                 break
         else:
             victories += 1
-    # Calcular puntos dinámicos finales
     dyn_points = calculate_dynamic_points(conn, c, cutoff)
     return {"derrotas": defeats, "victorias": victories, "puntos": dyn_points, "nuevas": processed}
 
-# --- Scheduler (igual que antes) ---
-def schedule_jobs():
-    schedule.every().day.at("00:00").do(daily_bank_job)
-    while True:
-        schedule.run_pending()
-        time.sleep(60)
-threading.Thread(target=schedule_jobs, daemon=True).start()
+# --- Iniciar scheduler de bancar streak ---
+threading.Thread(target=lambda: (schedule.every().day.at("00:00").do(daily_bank_job), schedule.run_pending()), daemon=True).start()
