@@ -101,12 +101,10 @@ def fetch_recent_matches(puuid: str, count: int = 5) -> list:
 def fetch_all_match_ids(puuid: str, page_size: int = 10) -> list:
     all_ids = []
     start = 0
-    # Calculamos medianoche en ms para filtrar sólo partidas de hoy
-    cutoff = int(datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000)
+    # Eliminamos el startTime de la URL para que Riot devuelva todos los IDs disponibles
     while True:
-        # Llamada paginada incluyendo startTime para filtrar fechas
         batch = riot_request(
-            f"/lol/match/v5/matches/by-puuid/{puuid}/ids?start={start}&count={page_size}&startTime={cutoff}"
+            f"/lol/match/v5/matches/by-puuid/{puuid}/ids?start={start}&count={page_size}"
         )
         if not batch:
             break
@@ -215,7 +213,7 @@ def procesar_partidas(id: RiotID):
         if c.fetchone():
             continue
         rec = process_match(mid, puuid, conn, c)
-        if not rec or rec["end_timestamp"] < cutoff:
+        if rec["end_timestamp"] < cutoff:
             continue
         c.execute("INSERT OR IGNORE INTO matches(match_id,queue_id,start_timestamp,end_timestamp) VALUES(?,?,?,?)", (rec['match_id'], rec['queue_id'], rec['start_timestamp'], rec['end_timestamp']))
         for evt in rec['events']:
