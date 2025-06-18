@@ -80,7 +80,7 @@ def riot_request(path: str) -> dict:
         resp = requests.get(url, headers=headers)
     resp.raise_for_status()
     data = resp.json()
-    time.sleep(0.1)
+    time.sleep(0.5)
     return data
 
 # Obtiene puuid
@@ -97,11 +97,14 @@ def fetch_recent_matches(puuid: str, count: int = 5) -> list:
         f"/lol/match/v5/matches/by-puuid/{puuid}/ids?start=0&count={count}"
     )
 
+# Nueva función: Pagina para recuperar todos los IDs de match disponibles
 def fetch_all_match_ids(puuid: str, page_size: int = 10) -> list:
     all_ids = []
     start = 0
+    # Calculamos medianoche en ms para filtrar sólo partidas de hoy
     cutoff = int(datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000)
     while True:
+        # Llamada paginada incluyendo startTime para filtrar fechas
         batch = riot_request(
             f"/lol/match/v5/matches/by-puuid/{puuid}/ids?start={start}&count={page_size}&startTime={cutoff}"
         )
@@ -206,6 +209,7 @@ def procesar_partidas(id: RiotID):
     c.execute("SELECT COUNT(*) FROM match_events me JOIN matches m ON me.match_id=m.match_id WHERE me.event='victoria' AND m.end_timestamp>=?", (cutoff,))
     victories = c.fetchone()[0]
     processed = []
+    # Usar paginación completa para IDs
     for mid in fetch_all_match_ids(puuid):
         c.execute("SELECT 1 FROM matches WHERE match_id=?", (mid,))
         if c.fetchone():
