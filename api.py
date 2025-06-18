@@ -80,7 +80,7 @@ def riot_request(path: str) -> dict:
         resp = requests.get(url, headers=headers)
     resp.raise_for_status()
     data = resp.json()
-    time.sleep(0.5)
+    time.sleep(0.1)
     return data
 
 # Obtiene puuid
@@ -97,12 +97,13 @@ def fetch_recent_matches(puuid: str, count: int = 5) -> list:
         f"/lol/match/v5/matches/by-puuid/{puuid}/ids?start=0&count={count}"
     )
 
-def fetch_all_match_ids(puuid: str, page_size: int = 100) -> list:
+def fetch_all_match_ids(puuid: str, page_size: int = 10) -> list:
     all_ids = []
     start = 0
+    cutoff = int(datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000)
     while True:
         batch = riot_request(
-            f"/lol/match/v5/matches/by-puuid/{puuid}/ids?start={start}&count={page_size}"
+            f"/lol/match/v5/matches/by-puuid/{puuid}/ids?start={start}&count={page_size}&startTime={cutoff}"
         )
         if not batch:
             break
