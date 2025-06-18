@@ -91,17 +91,11 @@ def get_puuid(game_name: str, tag_line: str) -> str:
         raise HTTPException(500, "No se obtuvo puuid")
     return puuid
 
-# Obtiene IDs recientes (count=5)
-def fetch_recent_matches(puuid: str, count: int = 5) -> list:
-    return riot_request(
-        f"/lol/match/v5/matches/by-puuid/{puuid}/ids?start=0&count={count}"
-    )
-
-# Nueva función: Pagina para recuperar todos los IDs de match disponibles
-def fetch_all_match_ids(puuid: str, page_size: int = 10) -> list:
+# Recupera todos los IDs en páginas de tamaño fijo
+# Luego se aplica el filtro de medianoche en el endpoint
+def fetch_all_match_ids(puuid: str, page_size: int = 5) -> list:
     all_ids = []
     start = 0
-    # Eliminamos el startTime de la URL para que Riot devuelva todos los IDs disponibles
     while True:
         batch = riot_request(
             f"/lol/match/v5/matches/by-puuid/{puuid}/ids?start={start}&count={page_size}"
@@ -166,6 +160,8 @@ def mark_streak_banked(conn, c, date_str):
     c.execute("UPDATE streak_bank SET has_banked=1 WHERE date=?", (date_str,))
     conn.commit()
 
+# Calcula puntos dinámicos
+# Recorre eventos de hoy en orden, rompe nada si rec es None skip
 def calculate_dynamic_points(conn, c, cutoff):
     rows = c.execute(
         "SELECT m.end_timestamp, me.event FROM match_events me "
@@ -187,7 +183,6 @@ def calculate_dynamic_points(conn, c, cutoff):
             if defeats >= DAILY_DEF_LIMIT:
                 break
     return points
-# === FIN BLOQUE STREAKS ===
 
 # Marca streak bancado al fin del día
 def daily_bank_job():
@@ -201,32 +196,46 @@ def procesar_partidas(id: RiotID):
     conn, c = get_db()
     puuid = get_puuid(id.game_name, id.tag_line)
     cutoff = int(datetime.now().replace(hour=0, minute=0, second=0, microsecond=0).timestamp() * 1000)
-    # Conteo inicial
-    c.execute("SELECT COUNT(*) FROM match_events me JOIN matches m ON me.match_id=m.match_id WHERE me.event='derrota' AND m.end_timestamp>=?", (cutoff,))
+
+    # Conteo inicial de derrotas y victorias de hoy
+    c.execute(
+        "SELECT COUNT(*) FROM match_events me JOIN matches m ON me.match_id=m.match_id "
+        "WHERE me.event='derrota' AND m.end_timestamp>=?", (cutoff,)
+    )
     defeats = c.fetchone()[0]
-    c.execute("SELECT COUNT(*) FROM match_events me JOIN matches m ON me.match_id=m.match_id WHERE me.event='victoria' AND m.end_timestamp>=?", (cutoff,))
+    c.execute(
+        "SELECT COUNT(*) FROM match_events me JOIN matches m ON me.match_id=m.match_id "
+        "WHERE me.event='victoria' AND m.end_timestamp>=?", (cutoff,)
+    )
     victories = c.fetchone()[0]
+
     processed = []
-    # Usar paginación completa para IDs
+    # Obtener IDs paginados y filtrar por tiempo
     for mid in fetch_all_match_ids(puuid):
-        c.execute("SELECT 1 FROM matches WHERE match_id=?", (mid,))
-        if c.fetchone():
-            continue
         rec = process_match(mid, puuid, conn, c)
+        # Saltar partidas inválidas o None antes de indexar
+        if not rec:
+            continue
         if rec["end_timestamp"] < cutoff:
             continue
-        c.execute("INSERT OR IGNORE INTO matches(match_id,queue_id,start_timestamp,end_timestamp) VALUES(?,?,?,?)", (rec['match_id'], rec['queue_id'], rec['start_timestamp'], rec['end_timestamp']))
+        # Guardar partida y actualizar streak
+        c.execute(
+            "INSERT OR IGNORE INTO matches(match_id,queue_id,start_timestamp,end_timestamp) VALUES(?,?,?,?)",
+            (rec['match_id'], rec['queue_id'], rec['start_timestamp'], rec['end_timestamp'])
+        )
         for evt in rec['events']:
             c.execute("INSERT INTO match_events(match_id,event) VALUES(?,?)", (rec['match_id'], evt))
             update_streak(conn, c, rec['end_timestamp'], evt=='victoria')
         conn.commit()
         processed.append(rec)
+        # Actualizar contadores locales
         if 'derrota' in rec['events']:
             defeats += 1
             if defeats >= DAILY_DEF_LIMIT:
                 break
         else:
             victories += 1
+
     dyn_points = calculate_dynamic_points(conn, c, cutoff)
     return {"derrotas": defeats, "victorias": victories, "puntos": dyn_points, "nuevas": processed}
 
