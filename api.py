@@ -261,9 +261,18 @@ def procesar_partidas(id: RiotID):
     conn, c = get_db()
     puuid = get_puuid(id.game_name, id.tag_line)
     summoner = id.game_name  # guardamos solo nombre, no tag_line
+    # Debug timezone: mostrar hora local y UTC y cutoff
+    local_now = datetime.now()
+    utc_now = datetime.utcnow()
+    print(f"DEBUG: local now = {local_now}")
+    print(f"DEBUG: UTC now   = {utc_now}")
+
     # Definir corte de día en formato cadena ISO
-    cutoff_dt = datetime.now().replace(hour=0, minute=0, second=0, microsecond=0)
+    cutoff_dt = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
     cutoff_fmt = cutoff_dt.strftime("%Y-%m-%d %H:%M:%S")
+    print(f"DEBUG: cutoff_dt     = {cutoff_dt}")
+    print(f"DEBUG: cutoff_fmt   = {cutoff_fmt}")
+
 
    # Conteo inicial (filtrado por summoner)
     c.execute(
