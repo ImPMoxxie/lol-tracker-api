@@ -6,6 +6,7 @@ import sqlite3
 import json
 import time
 from datetime import datetime
+from zoneinfo import ZoneInfo  # Para manejo de zona horaria
 from pydantic import BaseModel
 from riotwatcher import LolWatcher
 import schedule  # Para tareas programadas
@@ -26,6 +27,7 @@ DAILY_DEF_LIMIT = 5               # Límite derrotas diarias
 POINTS_PER_VICTORY_BASE = 5       # Puntos base por victoria
 ALLOWED_QUEUES = {400, 420, 440}  # Colas permitidas: Normal, Solo/Dúo, Flex
 RECENT_MATCH_COUNT = 20           # Cantidad de partidas a recuperar
+CHILE_TZ = ZoneInfo("America/Santiago")  # Zona horaria de Chile
 
 # NO BORRAR: Plan de ejercicios
 FULL_WORKOUT = [
@@ -70,8 +72,8 @@ def calculate_plan(defeats: int, points: int) -> dict:
 # --- Inicialización de FastAPI y RiotWatcher ---
 app = FastAPI(
     title="LoL Tracker API",
-    version="1.6.6",
-    description="Procesa partidas con cache local, streaks y plan de ejercicios"
+    version="1.6.7",
+    description="Procesa partidas con cache local, streaks, plan de ejercicios y zona horaria Chile"
 )
 watcher = LolWatcher(API_KEY)
 
@@ -177,8 +179,10 @@ def process_match(match_id: str, puuid: str, summoner_name: str, conn, c) -> dic
     # Formatea fechas legibles
     raw_end = info.get("gameEndTimestamp")
     raw_creation = info.get("gameCreation")
-    end_str = datetime.fromtimestamp(raw_end/1000).strftime("%Y-%m-%d %H:%M:%S")
-    creation_str = datetime.fromtimestamp(raw_creation/1000).strftime("%Y-%m-%d %H:%M:%S")
+    end_dt = datetime.fromtimestamp(raw_end/1000, CHILE_TZ)
+    creation_dt = datetime.fromtimestamp(raw_creation/1000, CHILE_TZ)
+    end_str = end_dt.strftime("%Y-%m-%d %H:%M:%S %Z")
+    creation_str = creation_dt.strftime("%Y-%m-%d %H:%M:%S %Z")
     
     result = {
         "match_id": match_id,
@@ -218,7 +222,7 @@ def mark_streak_banked(conn, c, date_str):
 
 # Calcula puntos dinámicos
 # Recorre eventos de hoy en orden, rompe nada si rec es None skip
-def calculate_dynamic_points(conn, c, cutoff: str, summoner_name: str) -> int:
+def calculate_dynamic_points(conn, c, cutoff_dt: datetime, summoner_name: str) -> int:
     """
     Recorre los eventos de hoy para un invocador específico y acumula puntos de streak:
       - Por victoria aumenta streak.
@@ -230,7 +234,7 @@ def calculate_dynamic_points(conn, c, cutoff: str, summoner_name: str) -> int:
         "JOIN matches m ON me.match_id=m.match_id "
         "WHERE m.game_creation>=? AND me.summoner_name=? "
         "ORDER BY m.end_timestamp", 
-        (cutoff, summoner_name)
+        (cutoff_dt.strftime("%Y-%m-%d"), summoner_name)
     ).fetchall()
     points = 0 
     streak = 0
@@ -252,50 +256,44 @@ def calculate_dynamic_points(conn, c, cutoff: str, summoner_name: str) -> int:
 # Marca streak bancado al fin del día
 def daily_bank_job():
     conn, c = get_db()
-    date_str = datetime.now().strftime('%Y-%m-%d')
+    date_str = datetime.now(CHILE_TZ).strftime('%Y-%m-%d')
+    from api import mark_streak_banked
     mark_streak_banked(conn, c, date_str)
-
+    
 # --- Endpoint principal ---
 @app.post("/procesar-partidas/")
 def procesar_partidas(id: RiotID):
     conn, c = get_db()
     puuid = get_puuid(id.game_name, id.tag_line)
     summoner = id.game_name  # guardamos solo nombre, no tag_line
-    # Debug timezone: mostrar hora local y UTC y cutoff
-    local_now = datetime.now()
-    utc_now = datetime.utcnow()
-    print(f"DEBUG: local now = {local_now}")
-    print(f"DEBUG: UTC now   = {utc_now}")
-
+    # Hora actual en Chile y corte de día
+    local_now = datetime.now(CHILE_TZ)
     # Definir corte de día en formato cadena ISO
     cutoff_dt = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
-    cutoff_fmt = cutoff_dt.strftime("%Y-%m-%d %H:%M:%S")
-    print(f"DEBUG: cutoff_dt     = {cutoff_dt}")
-    print(f"DEBUG: cutoff_fmt   = {cutoff_fmt}")
-
-
-   # Conteo inicial (filtrado por summoner)
+  
+   # Conteo inicial (filtrado por summoner y game_creation)
     c.execute(
         "SELECT COUNT(*) FROM match_events me JOIN matches m ON me.match_id=m.match_id "
         "WHERE me.event='derrota' AND m.game_creation>=? AND me.summoner_name=?", 
-        (cutoff_fmt, summoner)
+        (cutoff_dt.strftime("%Y-%m-%d"), summoner)
     )
     defeats = c.fetchone()[0]
     c.execute(
         "SELECT COUNT(*) FROM match_events me JOIN matches m ON me.match_id=m.match_id "
         "WHERE me.event='victoria' AND m.game_creation>=? AND me.summoner_name=?", 
-        (cutoff_fmt, summoner)
+        (cutoff_dt.strftime("%Y-%m-%d"), summoner)
     )
     victories = c.fetchone()[0]
 
     # Procesa e inserta partidas nuevas
+    processed = []
     for mid in fetch_recent_matches(puuid):
         # No procesar partidas ya registradas
         c.execute("SELECT 1 FROM matches WHERE match_id=? AND summoner_name=?", (mid, summoner))
         if c.fetchone():
             continue
         rec = process_match(mid, puuid, summoner, conn, c)
-        if rec is None or rec['game_creation_str'] < cutoff_fmt:
+        if not rec or rec["raw_creation"] < int(cutoff_dt.timestamp()*1000):
             continue
         # Inserción evitando duplicados gracias a UNIQUE
         c.execute(
@@ -309,14 +307,15 @@ def procesar_partidas(id: RiotID):
             )
             update_streak(conn, c, rec['raw_creation'], evt == 'victoria')
         conn.commit()
-        if 'derrota' in rec['events']:
+        processed.append(rec)
+        if evt == 'derrota':
             defeats += 1
             if defeats >= DAILY_DEF_LIMIT:
                 break
         else:
             victories += 1
 
-    dyn_points = calculate_dynamic_points(conn, c, cutoff_fmt, summoner)
+    dyn_points = calculate_dynamic_points(conn, c, cutoff_dt, summoner)
     plan = calculate_plan(defeats, dyn_points)  # NO BORRAR: Plan de ejercicios
 
     return {
