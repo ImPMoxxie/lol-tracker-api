@@ -1,4 +1,5 @@
-﻿import os
+﻿from calendar import c
+import os
 import threading  # Para hilos de scheduler
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException
@@ -25,7 +26,7 @@ REGIONAL = "americas"             # Región para Account y Match API
 DB_FILE = "lol_trackedb.db"       # Archivo SQLite
 DAILY_DEF_LIMIT = 5               # Límite derrotas diarias
 POINTS_PER_VICTORY_BASE = 5       # Puntos base por victoria
-ALLOWED_QUEUES = {400, 420, 440}  # Colas permitidas: Normal, Solo/Dúo, Flex
+ALLOWED_QUEUES = {400, 420, 440}  # Colas permitidas: Normal, Solo/Dúo, Flex, Normal (Quickplay)
 RECENT_MATCH_COUNT = 20           # Cantidad de partidas a recuperar
 CHILE_TZ = ZoneInfo("America/Santiago")  # Zona horaria de Chile
 
@@ -43,30 +44,15 @@ FULL_WORKOUT = [
     ("Saltos de sentadilla", 20)
 ]
 
-def calculate_plan(defeats: int, points: int) -> dict:
+def generate_base_plan(defeats: int) -> list[dict]:
     """
-    Genera el plan de ejercicios diario:
-      - Base: reps * derrotas.
-      - Se descuenta cada ejercicio completo si hay puntos suficientes.
-      - Si quedan puntos parciales, se descuenta de la siguiente lista.
+    Devuelve el plan completo en función de defeat (derrotas):
+      reps_base = reps_por_defeat × defeats
     """
-    # Reps totales sin descuento
-    base = [(name, reps * defeats) for name, reps in FULL_WORKOUT]
-    remaining = points
-    final = []
-    for name, reps in base:
-        if remaining >= reps:
-            remaining -= reps
-            # Ejercicio eliminado por completo (puntos cubren todo)
-            continue
-        if remaining > 0:
-            # Parcial: se descuenta lo que quede
-            final.append({"nombre": name, "reps": reps - remaining})
-            remaining = 0
-        else:
-            # Sin descuento
-            final.append({"nombre": name, "reps": reps})
-    return {"puntos_restantes": remaining, "ejercicios": final}
+    return [
+        {"nombre": name, "reps": reps * defeats}
+        for name, reps in FULL_WORKOUT
+    ]
 
 
 # --- Inicialización de FastAPI y RiotWatcher ---
@@ -106,6 +92,11 @@ CREATE TABLE IF NOT EXISTS streak_bank (
   date TEXT PRIMARY KEY,
   pending_streak INTEGER,
   has_banked INTEGER DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS user_points (
+  summoner_name TEXT PRIMARY KEY,
+  total_points  INTEGER NOT NULL DEFAULT 0,
+  last_accumulated_date TEXT DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS match_cache (
   match_id TEXT PRIMARY KEY,
@@ -251,6 +242,10 @@ def calculate_dynamic_points(conn, c, cutoff_dt: datetime, summoner_name: str) -
             defeats += 1
             if defeats >= DAILY_DEF_LIMIT:
                 break
+
+    if streak > 0:
+        points += streak * p_per_victory
+
     return points
 
 # Marca streak bancado al fin del día
@@ -266,10 +261,28 @@ def procesar_partidas(id: RiotID):
     conn, c = get_db()
     puuid = get_puuid(id.game_name, id.tag_line)
     summoner = id.game_name  # guardamos solo nombre, no tag_line
-    # Hora actual en Chile y corte de día
+
+
+    # DEBUG: entrada al endpoint
+    print(f"[DEBUG] Llamada a /procesar-partidas/ para {id.game_name}#{id.tag_line} en {datetime.now(CHILE_TZ)}")
+
+
+    # Obtener PUUID
+    try:
+        puuid = get_puuid(id.game_name, id.tag_line)
+        print(f"[DEBUG] PUUID obtenido: {puuid}")
+    except Exception as e:
+        print(f"[ERROR] get_puuid falló: {e}")
+        raise
+    summoner = id.game_name
+
+
+   # Corte de día local
     local_now = datetime.now(CHILE_TZ)
-    # Definir corte de día en formato cadena ISO
     cutoff_dt = local_now.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    print(f"[DEBUG] cutoff (ms):{cutoff_dt}")
+
   
    # Conteo inicial (filtrado por summoner y game_creation)
     c.execute(
@@ -284,10 +297,12 @@ def procesar_partidas(id: RiotID):
         (cutoff_dt.strftime("%Y-%m-%d"), summoner)
     )
     victories = c.fetchone()[0]
+    print(f"[DEBUG] Derrotas hoy: {defeats}, Victorias hoy: {victories}")
 
     # Procesa e inserta partidas nuevas
     processed = []
     for mid in fetch_recent_matches(puuid):
+        print(f"[DEBUG] Procesando match {mid}") # Debug
         # No procesar partidas ya registradas
         c.execute("SELECT 1 FROM matches WHERE match_id=? AND summoner_name=?", (mid, summoner))
         if c.fetchone():
@@ -315,16 +330,125 @@ def procesar_partidas(id: RiotID):
         else:
             victories += 1
 
-    dyn_points = calculate_dynamic_points(conn, c, cutoff_dt, summoner)
-    plan = calculate_plan(defeats, dyn_points)  # NO BORRAR: Plan de ejercicios
 
+    # DEBUG: partidas nuevas procesadas
+    print(f"[DEBUG] Partidas nuevas procesadas: {len(processed)} -> {[r['match_id'] for r in processed]}")
+
+    # Calcula puntos dinámicos del día
+    daily_points  = calculate_dynamic_points(conn, c, cutoff_dt, summoner)
+
+    # fecha de hoy para saber si ya acumulamos en esta fecha
+    today_str = cutoff_dt.strftime("%Y-%m-%d")
+
+    # timestamp completo para el registro con hora real
+    timestamp_str = local_now.strftime("%Y-%m-%d %H:%M:%S")
+
+    # lee total y última fecha de acumulación
+    c.execute("""
+      SELECT total_points, last_accumulated_date
+      FROM user_points
+      WHERE summoner_name = ?
+    """, (summoner,))
+    row = c.fetchone()
+
+    prev_total, last_date = (row if row else (0, ""))
+
+    # sólo sumamos si no se hizo hoy
+    if last_date.split(" ")[0] != today_str:
+        new_total = prev_total + daily_points
+        last_accumulated = timestamp_str
+    else:
+        new_total = prev_total
+        last_accumulated = last_date
+
+   
+    # guardamos con la hora real
+    c.execute("""
+      INSERT INTO user_points(summoner_name, total_points, last_accumulated_date)
+      VALUES (?, ?, ?)
+      ON CONFLICT(summoner_name) DO UPDATE
+        SET total_points = excluded.total_points,
+            last_accumulated_date = excluded.last_accumulated_date
+    """, (summoner, new_total, last_accumulated))
+    conn.commit()
+
+    #Genera plan de ejercicios
+    plan_base = generate_base_plan(defeats)
+
+    #Devuelve JSON con toda la info, incluyendo puntos totales
     return {
-        "derrotas": defeats,
-        "victorias": victories,
-        "puntos": dyn_points,
-        "puntos_restantes": plan["puntos_restantes"],
-        "plan_ejercicio": plan["ejercicios"]
+        "derrotas":        defeats,
+        "victorias":       victories,
+        "puntos_diarios":  daily_points,
+        "puntos_totales":  new_total,
+        "plan_base":       plan_base,
     }
+
+
+# Modelos de solicitud y respuesta
+class PointsRequest(BaseModel):
+    summoner_name: str
+    points: int
+
+class PointsResponse(BaseModel):
+    total_points: int
+
+# Endpoint para gastar puntos (+)
+@app.post("/gastar-puntos/", response_model=PointsResponse)
+def spend_points(req: PointsRequest):
+    conn, c = get_db()
+    if req.points <= 0:
+        raise HTTPException(status_code=400, detail="Points to spend must be positive")
+
+    # Leer saldo actual
+    c.execute(
+        "SELECT total_points FROM user_points WHERE summoner_name = ?", 
+        (req.summoner_name,)
+    )
+    row = c.fetchone()
+    if not row:
+        raise HTTPException(status_code=404, detail="Summoner not found")
+
+    current = row[0]
+    if req.points > current:
+        raise HTTPException(status_code=400, detail="Not enough points to spend")
+
+    # Actualizar saldo
+    new_total = current - req.points
+    c.execute(
+        "UPDATE user_points SET total_points = ? WHERE summoner_name = ?",
+        (new_total, req.summoner_name)
+    )
+    conn.commit()
+
+    return PointsResponse(total_points=new_total)
+
+
+# Endpoint para reembolsar puntos (-)
+@app.post("/reembolsar-puntos/", response_model=PointsResponse)
+def refund_points(req: PointsRequest):
+    conn, c = get_db()
+    if req.points <= 0:
+        raise HTTPException(status_code=400, detail="Points to refund must be positive")
+
+    c.execute(
+        "SELECT total_points FROM user_points WHERE summoner_name = ?", 
+        (req.summoner_name,)
+    )
+    row = c.fetchone()
+    if not row:
+        # Si no existe, podemos crear registro con puntos reembolsados o error
+        raise HTTPException(status_code=404, detail="Summoner not found")
+
+    current = row[0]
+    new_total = current + req.points
+    c.execute(
+        "UPDATE user_points SET total_points = ? WHERE summoner_name = ?",
+        (new_total, req.summoner_name)
+    )
+    conn.commit()
+
+    return PointsResponse(total_points=new_total)
 
 # --- Iniciar scheduler de bancar streak ---
 threading.Thread(
